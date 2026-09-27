@@ -1,0 +1,1034 @@
+
+/* =====================================================================
+   MOIL Mining Intelligence - prototype front end
+   The decision layer below is a faithful port of src/decision_engine.py:
+   the same AHP weights, the same weighted power mean, the same hard
+   constraint gates, the same verdict bands and the same counterfactual
+   transfer functions. Nothing on this page is a static mock-up.
+   ===================================================================== */
+const M = DATA.meta, CRIT = M.criteria, WV = CRIT.map(c => M.weights[c]);
+const VCOL = {GO:'var(--go)', GO_WITH_CONDITIONS:'var(--cond)', REVIEW_MORE_DATA:'var(--review)', NO_GO:'var(--nogo)'};
+const VTXT = {GO:'Go', GO_WITH_CONDITIONS:'Go with conditions', REVIEW_MORE_DATA:'Review / more data', NO_GO:'No-go'};
+
+/* ---------- inflate the packed table ---------- */
+const ROWS = DATA.rows.map(r => { const o = {}; DATA.cols.forEach((c,i) => o[c] = r[i]); return o; });
+const BY = {}; ROWS.forEach(r => { (BY[r.location_id] ||= {})[r.scenario] = r; });
+const LOCS = Object.keys(BY);
+const MON = DATA.monthly;
+
+/* ============================ DECISION ENGINE ======================== */
+const clamp = (x,a,b) => Math.max(a, Math.min(b, x));
+const u = (x,w,b) => clamp((x-w)/(b-w), 0, 1);
+const erf = x => { const s = x<0?-1:1; x = Math.abs(x);
+  const t = 1/(1+0.3275911*x), y = 1-(((((1.061405429*t-1.453152027)*t)+1.421413741)*t-0.284496736)*t+0.254829592)*t*Math.exp(-x*x);
+  return s*y; };
+const ncdf = z => 0.5*(1+erf(z/Math.SQRT2));
+
+function powerMean(s01, w, p) {
+  p = (p===undefined) ? M.p : p;
+  let acc = 0; for (let i=0;i<s01.length;i++) acc += w[i]*Math.pow(Math.max(s01[i],1e-9), p);
+  return Math.pow(acc, 1/p);
+}
+const s01of = r => CRIT.map(c => (r[c]||0)/100);
+const overall = (r, w, p) => 100*powerMean(s01of(r), w||WV, p);
+
+function gatesOf(r) {
+  const out = [];
+  const push = g => out.push(g);
+  if (r.operating_margin_percent < -5) push({id:'HC1_LOSS_MAKING', sev:'BLOCK',
+    label:'Operation loses money at the forecast production rate',
+    detail:'Operating margin '+r.operating_margin_percent.toFixed(1)+'% at forecast volume'});
+  if (r.break_even_safety_margin_percent < 0) push({id:'HC2_BELOW_BREAKEVEN', sev:'CONDITION',
+    label:'Forecast production sits below the break-even volume',
+    detail:'Break-even '+fmt(r.break_even_tonnes)+' t/month vs forecast '+fmt(r.forecast_production_tonnes_month)+' t/month'});
+  if (r.resource_category === 'Inferred' && r.geological_confidence < 45) push({id:'HC3_RESERVE_CONFIDENCE', sev:'REVIEW',
+    label:'Geological confidence too low to support a mining decision',
+    detail:'Inferred resource, geological confidence '+Math.round(r.geological_confidence)+'/100'});
+  if (r.dumpers_required > r.dumpers_available + r.standby_capacity + 2 || r.excavators_required > r.excavators_available + 1)
+    push({id:'HC4_FLEET_INFEASIBLE', sev:'CONDITION', label:'Required fleet cannot be assembled from available plus standby units',
+      detail:'Need '+r.dumpers_required+' dumpers / '+r.excavators_required+' excavators, have '+r.dumpers_available+' / '+r.excavators_available+' plus '+r.standby_capacity+' standby'});
+  if (r.shortfall_probability > 0.70 && r.shortfall_percent > 15) push({id:'HC5_SHORTFALL_RISK', sev:'CONDITION',
+    label:'Unacceptably high probability of missing the production target',
+    detail:'P(shortfall) '+Math.round(100*r.shortfall_probability)+'% with expected shortfall '+r.shortfall_percent.toFixed(1)+'%'});
+  if (r.data_confidence_score < 40) push({id:'HC6_DATA_FLOOR', sev:'REVIEW',
+    label:'Model and data confidence below the decision floor',
+    detail:'Data and model confidence '+Math.round(r.data_confidence_score)+'/100'});
+  if (r.reserve_estimate_tonnes < 120000) push({id:'HC7_SUB_SCALE_RESERVE', sev:'BLOCK',
+    label:'Reserve too small to justify a standalone block development',
+    detail:'Estimated reserve '+Math.round(r.reserve_estimate_tonnes/1000)+' kt'});
+  if (r.trafficability_wet_season < 25 && r.mining_method === 'OC') push({id:'HC8_WET_SEASON_ACCESS', sev:'CONDITION',
+    label:'Wet-season ground conditions prevent reliable haulage',
+    detail:'Wet-season trafficability '+Math.round(r.trafficability_wet_season)+'/100'});
+  return out;
+}
+
+function confidenceOf(r, gs) {
+  const fc = Math.max(r.forecast_production_tonnes_month, 1);
+  const width = (r.production_upper_bound - r.production_lower_bound)/fc;
+  const interval = Math.max(0, 1-(width-0.25)/0.95);
+  const stale = (r.data_quality_flag === 'DEGRADED' || r.data_quality_flag === 'STALE') ? 1 : 0;
+  let c = 0.58*(r.data_confidence_score/100) + 0.27*Math.min(1, interval) + 0.15*(1-0.5*stale);
+  c -= 0.10*gs.filter(g => g.sev === 'REVIEW').length;
+  return Math.round(1000*clamp(c,0,1))/10;
+}
+
+const RANK = {GO:0, GO_WITH_CONDITIONS:1, REVIEW_MORE_DATA:2, NO_GO:3};
+const capV = (v,c) => RANK[v] >= RANK[c] ? v : c;
+
+function verdictOf(score, conf, gs) {
+  let v = score >= M.bands.go ? 'GO' : score >= M.bands.conditional ? 'GO_WITH_CONDITIONS'
+        : score >= M.bands.review ? 'REVIEW_MORE_DATA' : 'NO_GO';
+  const why = ['Band verdict from overall feasibility '+score.toFixed(1)+'/100'];
+  gs.forEach(g => { const before = v;
+    if (g.sev === 'BLOCK') { v = 'NO_GO'; if (v !== before) why.push(g.id+' forces no-go: '+g.label); }
+    else if (g.sev === 'REVIEW') { if (v !== 'NO_GO') v = capV(v,'REVIEW_MORE_DATA');
+      if (v !== before) why.push(g.id+' forces review / more data: '+g.label); }
+    else { v = capV(v,'GO_WITH_CONDITIONS');
+      if (v !== before) why.push(g.id+' caps the verdict at conditional: '+g.label); }
+  });
+  if (conf < M.confReview && (v === 'GO' || v === 'GO_WITH_CONDITIONS')) {
+    v = 'REVIEW_MORE_DATA'; why.push('Decision confidence '+conf.toFixed(0)+'/100 is below the '+M.confReview+' floor for a positive verdict');
+  } else if (conf < M.confGo && v === 'GO') {
+    v = 'GO_WITH_CONDITIONS'; why.push('Decision confidence '+conf.toFixed(0)+'/100 downgrades go to conditional');
+  }
+  return {verdict:v, why:why};
+}
+
+function assess(r, w, p) {
+  const gs = gatesOf(r), sc = overall(r, w, p), cf = confidenceOf(r, gs);
+  const vv = verdictOf(sc, cf, gs);
+  return {score:sc, conf:cf, verdict:vv.verdict, why:vv.why, gates:gs};
+}
+
+/* exact Shapley over 7 criteria: 128 coalitions, enumerated */
+function shapley(r) {
+  const n = CRIT.length, s = s01of(r), base = CRIT.map(c => M.baseline[c]);
+  const cache = new Map();
+  const val = mask => { if (cache.has(mask)) return cache.get(mask);
+    const x = base.slice(); for (let i=0;i<n;i++) if (mask & (1<<i)) x[i] = s[i];
+    const v = 100*powerMean(x, WV); cache.set(mask, v); return v; };
+  const fact = [1,1,2,6,24,120,720,5040];
+  const phi = new Array(n).fill(0);
+  for (let mask=0; mask<(1<<n); mask++) {
+    const k = (mask.toString(2).match(/1/g)||[]).length;
+    for (let i=0;i<n;i++) if (!(mask & (1<<i))) {
+      phi[i] += fact[k]*fact[n-k-1]/fact[n]*(val(mask|(1<<i)) - val(mask));
+    }
+  }
+  const o = {}; CRIT.forEach((c,i) => o[c] = phi[i]); return o;
+}
+
+/* counterfactual transfer functions - ported from decision_engine.apply_driver */
+function applyDriver(r0, driver, value) {
+  const r = Object.assign({}, r0);
+  const tgt = r.production_target_tonnes_month, fc0 = r0.forecast_production_tonnes_month;
+  function reprod(newFc, newSigma) {
+    const s = newSigma === undefined ? r.forecast_sigma : newSigma;
+    r.forecast_production_tonnes_month = newFc;
+    r.shortfall_tonnes = Math.max(0, tgt-newFc);
+    r.shortfall_percent = 100*r.shortfall_tonnes/Math.max(tgt,1);
+    r.shortfall_probability = ncdf((Math.log(Math.max(tgt,1))-Math.log(Math.max(newFc,1)))/Math.max(s,1e-6));
+    r.forecast_sigma = s;
+    r.production_lower_bound = newFc*Math.exp(-1.2816*s);
+    r.production_upper_bound = newFc*Math.exp(1.2816*s);
+    const ci = (r.production_upper_bound-r.production_lower_bound)/Math.max(newFc,1);
+    r.production_reliability_score = 100*(0.50*(1-u(r.shortfall_probability,0.05,0.80))
+      + 0.30*(1-u(r.shortfall_percent,2,35)) + 0.20*(1-u(ci,0.25,1.10)));
+  }
+  function reecon() {
+    const price = r.ore_price_per_tonne, vc = r.variable_cost_per_tonne, fx = r.fixed_cost_month;
+    const fc = r.forecast_production_tonnes_month, rev = fc*price, cost = fx+vc*fc;
+    r.monthly_revenue = rev; r.monthly_operating_cost = cost; r.operating_margin = rev-cost;
+    r.operating_margin_percent = 100*(rev-cost)/Math.max(rev,1);
+    const contrib = price-vc;
+    r.break_even_tonnes = contrib > 1 ? fx/contrib : null;
+    r.break_even_price = fx/Math.max(fc,1)+vc;
+    r.break_even_safety_margin_percent = (r.break_even_tonnes != null && isFinite(r.break_even_tonnes))
+      ? Math.max(-300, 100*(fc-r.break_even_tonnes)/Math.max(fc,1)) : -300;
+    r.break_even_price_margin_percent = 100*(price-r.break_even_price)/Math.max(price,1);
+    r.economic_viability_score = 100*(0.40*u(r.operating_margin_percent,-30,55)
+      + 0.34*u(r.break_even_safety_margin_percent,-45,75) + 0.26*u(r.break_even_price_margin_percent,-25,60));
+  }
+  if (driver === 'availability') {
+    const a0 = r0.equipment_availability_percent/100, a1 = value/100;
+    r.equipment_availability_percent = value;
+    const s0 = 0.05+0.22*(1-a0), s1 = 0.05+0.22*(1-a1);
+    const sig = Math.sqrt(Math.max(r0.forecast_sigma**2-s0**2, 1e-4)+s1**2);
+    const fleetBinds = ['Dumper','Excavator','Crusher'].indexOf(r0.bottleneck_equipment) >= 0;
+    reprod(fleetBinds ? fc0*(a1/Math.max(a0,1e-6)) : fc0, sig);
+    r.equipment_adequacy_score = 100*(0.38*u(r.fleet_adequacy_score,35,96)+0.28*u(a1,0.58,0.92)
+      + 0.20*u(r.equipment_utilization_percent/100,0.35,0.85)+0.14*u(r.standby_capacity,0,3));
+    const dc = r0.maintenance_cost_per_tonne*0.9*(Math.max(0,0.80-a1)-Math.max(0,0.80-a0));
+    r.cost_per_tonne = r0.cost_per_tonne+dc;
+    r.variable_cost_per_tonne = r0.variable_cost_per_tonne*(r.cost_per_tonne/Math.max(r0.cost_per_tonne,1));
+    reecon();
+  } else if (driver === 'rainimpact') {
+    const base = 16.5*(1-r0.trafficability_index/100);
+    const newFc = fc0*(1-value/100)/Math.max(1-base/100, 1e-6);
+    const ws = Math.min(1, value/16.5);
+    r.trafficability_index = 100*(1-ws*0.70);
+    const s0 = 0.03+0.24*(base/16.5), s1 = 0.03+0.24*ws;
+    reprod(newFc, Math.sqrt(Math.max(r0.forecast_sigma**2-s0**2,1e-4)+s1**2));
+    r.environmental_feasibility_score = Math.max(0, r0.environmental_feasibility_score-1.9*(value-base));
+    r.operational_feasibility_score = Math.max(0, r0.operational_feasibility_score-1.1*(value-base));
+    reecon();
+  } else if (driver === 'price') {
+    r.ore_price_per_tonne = value; reecon();
+  } else if (driver === 'cost') {
+    const k = value/Math.max(r0.cost_per_tonne,1);
+    r.cost_per_tonne = value; r.variable_cost_per_tonne = r0.variable_cost_per_tonne*k;
+    r.fixed_cost_month = r0.fixed_cost_month*k; reecon();
+  } else if (driver === 'dumpers') {
+    const n0 = Math.max(1, r0.dumpers_available), n1 = Math.max(1, Math.round(value));
+    r.dumpers_available = n1;
+    if (r0.bottleneck_equipment === 'Dumper') reprod(fc0*n1/n0);
+    r.fleet_adequacy_score = Math.min(100, r0.fleet_adequacy_score*(0.75+0.25*n1/n0));
+    r.equipment_adequacy_score = Math.min(100, 100*(0.38*u(r.fleet_adequacy_score,35,96)
+      + 0.28*u(r.equipment_availability_percent/100,0.58,0.92)
+      + 0.20*u(r.equipment_utilization_percent/100,0.35,0.85)+0.14*u(r.standby_capacity,0,3)));
+    reecon();
+  } else if (driver === 'geoconf') {
+    const g0 = r0.geological_confidence/100, g1 = value/100;
+    r.geological_confidence = value;
+    r.reserve_attractiveness_score = Math.max(0, r0.reserve_attractiveness_score+12*(u(g1,0.20,0.90)-u(g0,0.20,0.90)));
+    const s0 = 0.04+0.16*(1-g0), s1 = 0.04+0.16*(1-g1);
+    const sig = Math.sqrt(Math.max(r0.forecast_sigma**2-s0**2,1e-4)+s1**2);
+    reprod(fc0, sig);
+    r.data_confidence_score = 100*(0.36*u(g1,0.25,0.92)+0.24*u(r.geological_data_quality,25,92)
+      + 0.22*(1-u(sig,0.12,0.46))+0.18*u(r.sampling_density||3,0.5,18));
+  }
+  return r;
+}
+
+const DRIVERS = [
+  {k:'availability', label:'Equipment availability', unit:'%', min:40, max:97, step:1, get:r=>r.equipment_availability_percent, fmt:v=>v.toFixed(0)+'%'},
+  {k:'rainimpact',  label:'Rainfall productivity impact', unit:'%', min:0, max:45, step:1, get:r=>16.5*(1-r.trafficability_index/100), fmt:v=>v.toFixed(0)+'%'},
+  {k:'price',       label:'Realised ore price', unit:'INR/t', min:3000, max:20000, step:100, get:r=>r.ore_price_per_tonne, fmt:v=>'\u20B9'+fmt(v)+'/t'},
+  {k:'cost',        label:'Cash cost', unit:'INR/t', min:1500, max:18000, step:100, get:r=>r.cost_per_tonne, fmt:v=>'\u20B9'+fmt(v)+'/t'},
+  {k:'dumpers',     label:'Dumpers allocated', unit:'units', min:1, max:16, step:1, get:r=>r.dumpers_available, fmt:v=>v.toFixed(0)+' units'},
+  {k:'geoconf',     label:'Geological confidence', unit:'/100', min:5, max:99, step:1, get:r=>r.geological_confidence, fmt:v=>v.toFixed(0)+'/100'}
+];
+
+function findFlip(r0, d) {
+  const base = assess(r0).verdict, start = d.get(r0);
+  const ends = [d.min, d.max];
+  let best = null;
+  ends.forEach(end => {
+    let prev = start, hit = null;
+    for (let i=1;i<=24;i++) {
+      const x = start+(end-start)*i/24;
+      if (assess(applyDriver(r0, d.k, x)).verdict !== base) { hit = [prev, x]; break; }
+      prev = x;
+    }
+    if (hit) {
+      let lo = hit[0], hi = hit[1];
+      for (let i=0;i<16;i++) { const mid = (lo+hi)/2;
+        if (assess(applyDriver(r0, d.k, mid)).verdict !== base) hi = mid; else lo = mid; }
+      const nv = assess(applyDriver(r0, d.k, hi)).verdict;
+      const gap = Math.abs(hi-start)/Math.max(Math.abs(start),1e-6);
+      if (!best || gap < best.gap) best = {at:hi, to:nv, gap:gap, dir:hi<start?'falls below':'exceeds'};
+    }
+  });
+  return best;
+}
+
+/* ============================== HELPERS ============================== */
+function fmt(n, d) { if (n === null || n === undefined || !isFinite(n)) return '\u2014';
+  return Number(n).toLocaleString('en-IN', {minimumFractionDigits:d||0, maximumFractionDigits:d||0}); }
+const nz = (v, s) => (v === null || v === undefined || v === '' || Number.isNaN(v)) ? (s||'\u2014') : v;
+const el = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+/* tiny SVG chart helpers */
+function svgOpen(w,h,cls){ return '<svg viewBox="0 0 '+w+' '+h+'" width="100%" height="'+h+'" class="'+(cls||'')+'">'; }
+function axisY(x0,y0,y1,vmin,vmax,ticks,fmtv){ let s=''; for(let i=0;i<=ticks;i++){
+  const v=vmin+(vmax-vmin)*i/ticks, y=y1-(y1-y0)*i/ticks;
+  s+='<line x1="'+x0+'" x2="100%" y1="'+y+'" y2="'+y+'" stroke="#E6ECF1" stroke-width="1"/>';
+  s+='<text x="'+(x0-5)+'" y="'+(y+3)+'" text-anchor="end" font-size="8.5" fill="#8C9BAA">'+(fmtv?fmtv(v):Math.round(v))+'</text>'; } return s; }
+const MLAB = ['J','F','M','A','M','J','J','A','S','O','N','D'];
+
+function lineChart(series, opts) {
+  const w = 420, h = opts.h || 150, x0 = 34, x1 = w-8, y0 = 10, y1 = h-18;
+  let vmin = opts.min !== undefined ? opts.min : Math.min(...series.flatMap(s => s.v));
+  let vmax = opts.max !== undefined ? opts.max : Math.max(...series.flatMap(s => s.v));
+  if (vmax === vmin) vmax = vmin+1;
+  const X = i => x0+(x1-x0)*i/11, Y = v => y1-(y1-y0)*(v-vmin)/(vmax-vmin);
+  let s = svgOpen(w,h);
+  s += '<rect x="'+X(5)+'" y="'+y0+'" width="'+(X(8)-X(5))+'" height="'+(y1-y0)+'" fill="#D9D2C5" opacity=".35"/>';
+  s += '<text x="'+((X(5)+X(8))/2)+'" y="'+(y0+9)+'" text-anchor="middle" font-size="8" fill="#8C9BAA">monsoon</text>';
+  s += axisY(x0,y0,y1,vmin,vmax,3,opts.fmtv);
+  if (opts.band) { let d = 'M'; opts.band.lo.forEach((v,i) => d += X(i)+','+Y(v)+' L');
+    d = d.slice(0,-2); for (let i=11;i>=0;i--) d += ' L'+X(i)+','+Y(opts.band.hi[i]); d += ' Z';
+    s += '<path d="'+d+'" fill="'+(opts.band.color||'#64798F')+'" opacity=".16"/>'; }
+  series.forEach(se => { let d = ''; se.v.forEach((v,i) => d += (i?' L':'M')+X(i)+','+Y(v));
+    s += '<path d="'+d+'" fill="none" stroke="'+se.c+'" stroke-width="'+(se.w||1.7)+'"'+(se.dash?' stroke-dasharray="4 3"':'')+'/>'; });
+  for (let i=0;i<12;i++) s += '<text x="'+X(i)+'" y="'+(h-5)+'" text-anchor="middle" font-size="8" fill="#8C9BAA">'+MLAB[i]+'</text>';
+  return s+'</svg>';
+}
+
+function hbars(items, opts) {
+  const w = 420, rowh = 20, h = items.length*rowh+8, lw = opts.labelw || 120;
+  const vmax = Math.max(...items.map(i => Math.max(i.a||0, i.b||0)), 1);
+  let s = svgOpen(w,h);
+  items.forEach((it,i) => { const y = 6+i*rowh;
+    s += '<text x="0" y="'+(y+11)+'" font-size="10.5" fill="#1E3247">'+esc(it.label)+'</text>';
+    const bx = lw, bw = w-lw-54;
+    s += '<rect x="'+bx+'" y="'+(y+2)+'" width="'+(bw*(it.a/vmax))+'" height="6" fill="#64798F" rx="1"/>';
+    s += '<rect x="'+bx+'" y="'+(y+10)+'" width="'+(bw*(it.b/vmax))+'" height="6" fill="'+(it.b>it.a?'#A32E27':'#2F7D5B')+'" rx="1"/>';
+    s += '<text x="'+w+'" y="'+(y+12)+'" text-anchor="end" font-size="9.5" font-family="ui-monospace,monospace" fill="#0B1B2B">'+it.a+' / '+it.b+'</text>'; });
+  return s+'</svg>';
+}
+
+function stackbar(parts, total, opts) {
+  const w = 420, h = 26+parts.length*15; let s = svgOpen(w,h), x = 0;
+  const pal = ['#1E3247','#2F4F6B','#44708F','#64798F','#8C9BAA','#B0BCC7','#D2DBE3'];
+  parts.forEach((p,i) => { const pw = (w)*(p.v/total);
+    s += '<rect x="'+x+'" y="0" width="'+Math.max(pw,0)+'" height="16" fill="'+pal[i%pal.length]+'"/>'; x += pw; });
+  parts.forEach((p,i) => { const y = 30+i*15;
+    s += '<rect x="0" y="'+(y-7)+'" width="8" height="8" fill="'+pal[i%pal.length]+'"/>';
+    s += '<text x="13" y="'+y+'" font-size="10" fill="#1E3247">'+esc(p.label)+'</text>';
+    s += '<text x="'+w+'" y="'+y+'" text-anchor="end" font-size="10" font-family="ui-monospace,monospace" fill="#0B1B2B">\u20B9'+fmt(p.v)+'  ('+(100*p.v/total).toFixed(0)+'%)</text>'; });
+  return s+'</svg>';
+}
+
+/* ============================== STATE ================================ */
+const S = {page:'p1', scen:'base_case', sel:LOCS[0], q:'',
+  f:{mine:new Set(), verdict:new Set(), method:new Set(), res:0, grade:20, conf:0, env:100, sf:100, ec:0},
+  cf:{}, weights:WV.slice()};
+
+const rec = (lid, sc) => BY[lid][sc || S.scen];
+const cur = () => rec(S.sel);
+
+function decisionFor(lid, sc) { return assess(rec(lid, sc)); }
+
+/* ============================== FILTERS ============================== */
+function passes(r) {
+  const d = decisionFor(r.location_id);
+  if (S.f.mine.size && !S.f.mine.has(r.mine_name)) return false;
+  if (S.f.verdict.size && !S.f.verdict.has(d.verdict)) return false;
+  if (S.f.method.size && !S.f.method.has(r.mining_method)) return false;
+  if (r.reserve_estimate_tonnes/1000 < S.f.res) return false;
+  if (r.grade_mn_percent < S.f.grade) return false;
+  if (r.geological_confidence < S.f.conf) return false;
+  if (r.environmental_severity_score > S.f.env) return false;
+  if (100*r.shortfall_probability > S.f.sf) return false;
+  if (r.economic_viability_score < S.f.ec) return false;
+  if (S.q) { const t = (r.location_id+' '+r.mine_name+' '+r.block_id).toLowerCase();
+    if (t.indexOf(S.q.toLowerCase()) < 0) return false; }
+  return true;
+}
+const visible = () => LOCS.map(l => rec(l)).filter(passes);
+
+/* ==================== MINE PLAN MAP (per block) ====================== */
+const MM_W = 600, MM_H = 430, MM_MAPH = 336;
+const mmCache = {};
+
+function fnv(s){let h=2166136261;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619);}return h>>>0;}
+function rngOf(x){let a=(x>>>0)||1;return function(){a^=a<<13;a>>>=0;a^=a>>>17;a^=a<<5;a>>>=0;return a/4294967296;};}
+const F1=v=>v.toFixed(1);
+
+function spline(p, closed){
+  const n=p.length, P=i=>p[((i%n)+n)%n];
+  let d='M'+F1(P(0)[0])+' '+F1(P(0)[1]);
+  const last = closed ? n : n-1;
+  for(let i=0;i<last;i++){
+    const a=P(i-1),b=P(i),c=P(i+1),e=P(i+2);
+    d+='C'+F1(b[0]+(c[0]-a[0])/6)+' '+F1(b[1]+(c[1]-a[1])/6)+' '
+       +F1(c[0]-(e[0]-b[0])/6)+' '+F1(c[1]-(e[1]-b[1])/6)+' '+F1(c[0])+' '+F1(c[1]);
+  }
+  return d+(closed?'Z':'');
+}
+function ring(cx,cy,rx,ry,n,rough,rnd,ph){
+  const p=[];
+  for(let i=0;i<n;i++){const a=(ph||0)+2*Math.PI*i/n, k=1+(rough||0)*(rnd()*2-1);
+    p.push([cx+rx*k*Math.cos(a), cy+ry*k*Math.sin(a)]);}
+  return p;
+}
+function nestedRings(cx,cy,rx,ry,levels,shrink,rnd,rough){
+  const n=18, noise=[]; for(let i=0;i<n;i++) noise.push(1+(rough||0.15)*(rnd()*2-1));
+  const out=[];
+  for(let L=0;L<levels;L++){
+    const f=1-L*shrink, p=[];
+    for(let i=0;i<n;i++){const a=2*Math.PI*i/n;
+      p.push([cx+rx*f*noise[i]*Math.cos(a), cy+ry*f*noise[i]*Math.sin(a)]);}
+    out.push(p);
+  }
+  return out;
+}
+/* short tick marks on one side of a path - bench faces / outcrop dip ticks */
+function ticks(pts, len, inward, every){
+  let s='';
+  for(let i=0;i<pts.length;i+=(every||1)){
+    const a=pts[i], b=pts[(i+1)%pts.length];
+    const dx=b[0]-a[0], dy=b[1]-a[1], L=Math.hypot(dx,dy)||1;
+    const nx=(inward? dy:-dy)/L, ny=(inward? -dx:dx)/L;
+    s+='<line x1="'+F1(a[0])+'" y1="'+F1(a[1])+'" x2="'+F1(a[0]+nx*len)+'" y2="'+F1(a[1]+ny*len)+'"/>';
+  }
+  return s;
+}
+function leader(x1,y1,x2,y2,label,anchor){
+  return '<g class="mm-ann"><path d="M'+F1(x1)+' '+F1(y1)+'L'+F1(x2)+' '+F1(y2)+'" marker-end="url(#mmArrow)"/>'
+   +'<text x="'+F1(x1)+'" y="'+F1(y1-3)+'" text-anchor="'+(anchor||'middle')+'">'+esc(label)+'</text></g>';
+}
+
+function minePlanSVG(r, d){
+  const key=r.location_id+'|'+S.scen;
+  if(mmCache[key]) return mmCache[key];
+  const rnd=rngOf(fnv(r.location_id)), OC=(r.mining_method==='OC');
+  const W=MM_W,H=MM_H,MH=MM_MAPH, m=9;
+  const cx=W*0.44+(rnd()*40-20), cy=MH*0.47+(rnd()*24-12);
+  const baseEl=Math.round(r.elevation_m/10)*10;
+
+  let s='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 '+W+' '+H+'" width="'+W+'" height="'+H+'" class="mmsvg">';
+  s+='<defs>'
+   +'<pattern id="mmStip" width="7" height="7" patternUnits="userSpaceOnUse">'
+   +'<circle cx="1.4" cy="1.4" r=".6" fill="#9AA79B"/><circle cx="5" cy="4.6" r=".6" fill="#9AA79B"/></pattern>'
+   +'<pattern id="mmDump" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">'
+   +'<line x1="0" y1="0" x2="0" y2="6" stroke="#9C7B4E" stroke-width="1"/></pattern>'
+   +'<pattern id="mmOre" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(-38)">'
+   +'<line x1="0" y1="0" x2="0" y2="5" stroke="#6E5470" stroke-width="1.6"/></pattern>'
+   +'<marker id="mmArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5.5" markerHeight="5.5" orient="auto-start-reverse">'
+   +'<path d="M0 1L9 5L0 9z" fill="#A32E27"/></marker>'
+   +'<clipPath id="mmClip"><rect x="'+m+'" y="'+m+'" width="'+(W-2*m)+'" height="'+(MH-m)+'"/></clipPath>'
+   +'</defs>'
+   +'<style>'
+   +'.mmsvg{font-family:ui-sans-serif,"Segoe UI",Arial,sans-serif}'
+   +'.mm-c{fill:none;stroke:#A9B3A6;stroke-width:.7}.mm-c5{stroke:#8B9789;stroke-width:1.2}'
+   +'.mm-cl{font-size:6.5px;fill:#7C8A7B}'
+   +'.mm-lease{fill:none;stroke:#3C4F63;stroke-width:1.2;stroke-dasharray:9 3 2 3}'
+   +'.mm-seam{fill:none;stroke:#4A2F52;stroke-width:2.6;stroke-linecap:round}'
+   +'.mm-seamt{stroke:#4A2F52;stroke-width:1}'
+   +'.mm-bench{fill:none;stroke:#3C4F63;stroke-width:1}'
+   +'.mm-benchT{stroke:#7C8FA3;stroke-width:.7}'
+   +'.mm-crest{fill:none;stroke:#1E3247;stroke-width:1.9}'
+   +'.mm-road{fill:none;stroke:#8A6B3A;stroke-width:3.4;stroke-linecap:round}'
+   +'.mm-roadc{fill:none;stroke:#F3E8D2;stroke-width:1.3;stroke-dasharray:5 4}'
+   +'.mm-water{fill:none;stroke:#5C88A8;stroke-width:1.3}'
+   +'.mm-pillar{fill:#FFFFFF;stroke:#1E3247;stroke-width:.8}'
+   +'.mm-gal{fill:none;stroke:#1E3247;stroke-width:.8}'
+   +'.mm-drive{fill:none;stroke:#1E3247;stroke-width:2.2}'
+   +'.mm-bh{fill:#FFFFFF;stroke:#1E3247;stroke-width:1}'
+   +'.mm-bhl{font-size:6px;fill:#4A5A6B;font-family:ui-monospace,monospace}'
+   +'.mm-lbl{font-size:7.6px;fill:#22384E}'
+   +'.mm-ann path{fill:none;stroke:#A32E27;stroke-width:1.1}'
+   +'.mm-ann text{font-size:7.6px;fill:#A32E27;font-weight:600}'
+   +'.mm-tb{font-size:8px;fill:#1E3247}.mm-tbk{font-size:6.6px;fill:#7C8A96}'
+   +'.mm-tbv{font-size:8.4px;fill:#0B1B2B;font-family:ui-monospace,monospace;font-weight:600}'
+   +'</style>';
+
+  /* sheet */
+  s+='<rect width="'+W+'" height="'+H+'" fill="#FBFAF5"/>';
+  s+='<rect x="'+m+'" y="'+m+'" width="'+(W-2*m)+'" height="'+(MH-m)+'" fill="#F4F6F1" stroke="#1E3247" stroke-width="1.1"/>';
+  s+='<rect x="'+m+'" y="'+m+'" width="'+(W-2*m)+'" height="'+(MH-m)+'" fill="url(#mmStip)" opacity=".5"/>';
+  s+='<g clip-path="url(#mmClip)">';
+
+  /* ---- contours ---- */
+  const cont=nestedRings(cx,cy,215,158,9,0.098,rnd,0.135);
+  cont.forEach((p,i)=>{
+    const major=(i%2===0);
+    s+='<path class="mm-c'+(major?' mm-c5':'')+'" d="'+spline(p,true)+'"/>';
+    if(major){ const q=p[3];
+      s+='<text class="mm-cl" x="'+F1(q[0])+'" y="'+F1(q[1]-1.5)+'" text-anchor="middle">'+(baseEl+i*10)+'</text>'; }
+  });
+
+  /* ---- drainage ---- */
+  const wp=[]; for(let i=0;i<7;i++) wp.push([m+8+i*(W-2*m-16)/6, MH-38-Math.sin(i*1.05+rnd())*26-rnd()*12]);
+  s+='<path class="mm-water" d="'+spline(wp,false)+'"/>';
+  s+='<text class="mm-lbl" x="'+F1(wp[1][0])+'" y="'+F1(wp[1][1]+11)+'" fill="#5C88A8">Nallah</text>';
+
+  /* ---- ore seam outcrop ---- */
+  const sp=[]; const sy=Math.max(m+52, cy-96-rnd()*18);
+  for(let i=0;i<8;i++) sp.push([m+4+i*(W-2*m-8)/7, sy+Math.sin(i*0.85+1.4)*30+(rnd()*10-5)]);
+  s+='<path class="mm-seam" d="'+spline(sp,false)+'"/>';
+  s+='<g class="mm-seamt">'+ticks(sp.slice(0,7),6,false,1)+'</g>';
+  s+='<text class="mm-lbl" x="'+F1(sp[4][0])+'" y="'+F1(sp[4][1]+14)+'" text-anchor="middle">Mn seam outcrop</text>';
+
+  /* ---- lease boundary ---- */
+  const lb=[[m+16,m+14],[W-m-16,m+20],[W-m-22,MH-16],[m+22,MH-10]];
+  s+='<path class="mm-lease" d="M'+lb.map(p=>F1(p[0])+' '+F1(p[1])).join('L')+'Z"/>';
+  s+='<text class="mm-lbl" x="'+(m+24)+'" y="'+(m+26)+'" fill="#3C4F63">Lease boundary</text>';
+
+  let entryX, entryY, annots='';
+
+  if(OC){
+    /* ---------------- OPENCAST: benched pit ---------------- */
+    const benches=Math.max(3, Math.min(7, Math.round(r.ore_depth_m/14)+2));
+    const pit=nestedRings(cx,cy+16,116,80,benches,0.135,rnd,0.13);
+    s+='<path d="'+spline(pit[0],true)+'" fill="#E9E2D3" stroke="none"/>';
+    pit.forEach((p,i)=>{
+      s+='<path class="'+(i===0?'mm-crest':'mm-bench')+'" d="'+spline(p,true)+'"/>';
+      s+='<g class="mm-benchT">'+ticks(p,4.2,true,1)+'</g>';
+    });
+    const floor=pit[pit.length-1];
+    s+='<path d="'+spline(floor,true)+'" fill="url(#mmOre)" opacity=".55"/>';
+    s+='<path d="'+spline(floor,true)+'" fill="none" stroke="#4A2F52" stroke-width="1.3"/>';
+    /* ramp spiralling out of the pit */
+    const rp=[]; for(let i=0;i<=22;i++){ const t=i/22, ang=2.55-t*3.4, rr=1-t*0.72;
+      rp.push([cx+116*rr*Math.cos(ang)*1.02, (cy+16)+80*rr*Math.sin(ang)*1.02]); }
+    s+='<path class="mm-road" d="'+spline(rp,false)+'"/><path class="mm-roadc" d="'+spline(rp,false)+'"/>';
+    /* sump */
+    const sup=ring(cx-26,cy+46,13,8,9,0.2,rnd,0);
+    s+='<path d="'+spline(sup,true)+'" fill="#BBD3E2" stroke="#5C88A8" stroke-width=".9"/>';
+    /* active faces */
+    const nf=Math.max(1,Math.min(4,r.active_faces||2));
+    for(let i=0;i<nf;i++){ const a=0.9+i*1.5, p=pit[1][(3+i*4)%pit[1].length];
+      s+='<rect x="'+F1(p[0]-7)+'" y="'+F1(p[1]-4)+'" width="14" height="8" fill="#A32E27" opacity=".72" transform="rotate('+F1(a*22)+','+F1(p[0])+','+F1(p[1])+')"/>'; }
+    /* overburden dump, clear of the seam outcrop */
+    const dmp=ring(W-m-78,m+112,48,33,11,0.2,rnd,0.4);
+    s+='<path d="'+spline(dmp,true)+'" fill="url(#mmDump)" opacity=".5" stroke="#9C7B4E" stroke-width="1.1"/>';
+    s+='<text class="mm-lbl" x="'+(W-m-78)+'" y="'+(m+114)+'" text-anchor="middle" fill="#7A5D34">OB dump</text>';
+    /* surface haul road from the ramp exit to the plant */
+    const ex=rp[0][0], ey=rp[0][1];
+    const hr=[[ex,ey],[ex-46,ey+15],[ex-100,ey+7],[m+4,ey+22]];
+    s+='<path class="mm-road" d="'+spline(hr,false)+'"/><path class="mm-roadc" d="'+spline(hr,false)+'"/>';
+    const kx=m+26, ky=ey+14;
+    s+='<rect x="'+F1(kx)+'" y="'+F1(ky)+'" width="18" height="12" fill="#fff" stroke="#1E3247" stroke-width="1.1"/>'
+      +'<path d="M'+F1(kx)+' '+F1(ky)+'l18 12M'+F1(kx+18)+' '+F1(ky)+'l-18 12" stroke="#1E3247" stroke-width=".8"/>'
+      +'<text class="mm-lbl" x="'+F1(kx+9)+'" y="'+F1(ky+22)+'" text-anchor="middle">Crusher</text>';
+    entryX=ex; entryY=ey;
+    annots+=leader(cx+120,cy-64, cx+60,cy-34,'Working benches','start');
+    annots+=leader(cx+124,cy+14, cx+36,cy+18,'Ore floor / Mn body','start');
+    annots+=leader(cx-16,cy+116, cx-48,cy+72,'Haul ramp');
+    annots+=leader(cx-126,cy+52, cx-40,cy+44,'Pit sump','start');
+  } else {
+    /* ---------------- UNDERGROUND: room and pillar ---------------- */
+    const outline=ring(cx,cy+22,112,74,14,0.14,rnd,0.2);
+    s+='<path d="'+spline(outline,true)+'" fill="#FFFFFF" fill-opacity=".85" stroke="#1E3247" stroke-width="1.4" stroke-dasharray="2 2"/>';
+    /* pillar grid, rotated */
+    const rot=(rnd()*24-12)*Math.PI/180, cs=Math.cos(rot), sn=Math.sin(rot);
+    s+='<g>';
+    for(let gx=-5;gx<=5;gx++) for(let gy=-3;gy<=3;gy++){
+      const lx=gx*19, ly=gy*19;
+      const px=cx+lx*cs-ly*sn, py=(cy+22)+lx*sn+ly*cs;
+      if(Math.hypot((px-cx)/104,(py-cy-22)/66)>1) continue;
+      s+='<rect class="mm-pillar" x="'+F1(px-6)+'" y="'+F1(py-6)+'" width="12" height="12" '
+        +'transform="rotate('+F1(rot*180/Math.PI)+','+F1(px)+','+F1(py)+')"/>';
+    }
+    s+='</g>';
+    /* main drives from the adit */
+    const ax=cx-140, ay=cy+34;
+    s+='<path class="mm-drive" d="M'+F1(ax)+' '+F1(ay)+'L'+F1(cx-96)+' '+F1(cy+28)+'"/>';
+    s+='<path class="mm-drive" d="M'+F1(cx-96)+' '+F1(cy+28)+'L'+F1(cx+84)+' '+F1(cy+16)+'"/>';
+    s+='<path class="mm-gal" d="M'+F1(cx-40)+' '+F1(cy-14)+'L'+F1(cx-34)+' '+F1(cy+68)+'"/>';
+    s+='<path class="mm-gal" d="M'+F1(cx+34)+' '+F1(cy-16)+'L'+F1(cx+40)+' '+F1(cy+64)+'"/>';
+    /* adit portal */
+    s+='<path d="M'+F1(ax-9)+' '+F1(ay-8)+'L'+F1(ax)+' '+F1(ay-8)+'L'+F1(ax)+' '+F1(ay+8)+'L'+F1(ax-9)+' '+F1(ay+8)+'" fill="#1E3247"/>';
+    s+='<path d="M'+F1(ax)+' '+F1(ay-8)+'L'+F1(ax+13)+' '+F1(ay-4)+'M'+F1(ax)+' '+F1(ay+8)+'L'+F1(ax+13)+' '+F1(ay+4)+'" stroke="#1E3247" stroke-width="1.3" fill="none"/>';
+    /* ventilation shaft */
+    const vx=cx+92, vy=cy-40;
+    s+='<rect x="'+F1(vx-5)+'" y="'+F1(vy-5)+'" width="10" height="10" fill="#fff" stroke="#1E3247" stroke-width="1.2"/>'
+      +'<path d="M'+F1(vx-5)+' '+F1(vy-5)+'L'+F1(vx+5)+' '+F1(vy+5)+'M'+F1(vx+5)+' '+F1(vy-5)+'L'+F1(vx-5)+' '+F1(vy+5)+'" stroke="#1E3247" stroke-width="1"/>';
+    /* surface haul road to the portal */
+    const hr=[[m+2,ay+44],[ax-46,ay+26],[ax-14,ay+6],[ax-2,ay]];
+    s+='<path class="mm-road" d="'+spline(hr,false)+'"/><path class="mm-roadc" d="'+spline(hr,false)+'"/>';
+    entryX=ax; entryY=ay;
+    annots+=leader(ax-14,ay-40, ax-2,ay-10,'Mine entry (incline)','middle');
+    annots+=leader(cx+22,cy+118, cx+8,cy+66,'Room-and-pillar workings');
+    annots+=leader(vx+26,vy-24, vx+4,vy-8,'Ventilation shaft','start');
+    annots+=leader(m+70,ay+62, m+54,ay+40,'Surface haul road','start');
+  }
+
+  /* ---- boreholes ---- */
+  const nbh=Math.max(4,Math.min(13,Math.round(r.sampling_density||6)));
+  for(let i=0;i<nbh;i++){
+    const a=rnd()*Math.PI*2, rr=0.35+rnd()*0.75;
+    const bx=cx+165*rr*Math.cos(a), by=cy+118*rr*Math.sin(a);
+    if(bx<m+14||bx>W-m-14||by<m+14||by>MH-14) continue;
+    s+='<circle class="mm-bh" cx="'+F1(bx)+'" cy="'+F1(by)+'" r="2.7"/><circle cx="'+F1(bx)+'" cy="'+F1(by)+'" r=".9" fill="#1E3247"/>';
+    if(i<4) s+='<text class="mm-bhl" x="'+F1(bx+4)+'" y="'+F1(by-3)+'">BH-'+String(i+1).padStart(2,'0')+'</text>';
+  }
+  s+=annots;
+  s+='</g>';
+
+  /* ---- north arrow + scale ---- */
+  const nx0=W-m-26, ny0=m+16;
+  s+='<g><path d="M'+nx0+' '+(ny0+22)+'L'+nx0+' '+(ny0-6)+'" stroke="#1E3247" stroke-width="1.2"/>'
+    +'<path d="M'+(nx0-5)+' '+(ny0+2)+'L'+nx0+' '+(ny0-9)+'L'+(nx0+5)+' '+(ny0+2)+'Z" fill="#1E3247"/>'
+    +'<text x="'+nx0+'" y="'+(ny0+32)+'" text-anchor="middle" class="mm-tb" font-weight="600">N</text></g>';
+  const sbw=76, sbx=m+16, sby=MH-20;
+  s+='<g><rect x="'+sbx+'" y="'+sby+'" width="'+sbw+'" height="4.5" fill="#fff" stroke="#1E3247" stroke-width=".9"/>'
+    +'<rect x="'+sbx+'" y="'+sby+'" width="'+(sbw/2)+'" height="4.5" fill="#1E3247"/>'
+    +'<text x="'+sbx+'" y="'+(sby-3)+'" class="mm-tbk">0</text>'
+    +'<text x="'+(sbx+sbw)+'" y="'+(sby-3)+'" class="mm-tbk" text-anchor="end">500 m</text></g>';
+
+  /* ---- title block ---- */
+  const ty=MH+8;
+  s+='<rect x="'+m+'" y="'+ty+'" width="'+(W-2*m)+'" height="'+(H-ty-m)+'" fill="#FFFFFF" stroke="#1E3247" stroke-width="1.1"/>';
+  s+='<text x="'+(m+10)+'" y="'+(ty+16)+'" class="mm-tb" font-weight="700" font-family="ui-monospace,monospace">'+esc(r.location_id)+'</text>';
+  s+='<text x="'+(m+112)+'" y="'+(ty+16)+'" class="mm-tb">'+esc(r.mine_name)+' &#183; '+esc(r.block_id)+' &#183; '
+    +(OC?'Opencast':'Underground')+' &#183; '+esc(r.district)+'</text>';
+  s+='<rect x="'+(W-m-104)+'" y="'+(ty+6)+'" width="94" height="14" rx="2" fill="'+VCOL[d.verdict]+'"/>'
+    +'<text x="'+(W-m-57)+'" y="'+(ty+16)+'" text-anchor="middle" font-size="8.4" fill="#fff" font-weight="600">'+VTXT[d.verdict]+'</text>';
+  s+='<line x1="'+(m+8)+'" y1="'+(ty+23)+'" x2="'+(W-m-8)+'" y2="'+(ty+23)+'" stroke="#D2DBE3"/>';
+  const cells=[['Reserve',fmt(r.reserve_estimate_tonnes/1000)+' kt'],['Mn grade',r.grade_mn_percent.toFixed(1)+'%'],
+    ['Seam thickness',r.ore_thickness_m.toFixed(1)+' m'],['Depth to ore',Math.round(r.ore_depth_m)+' m'],
+    [OC?'Strip ratio':'Dip/access',OC?r.strip_ratio.toFixed(2)+':1':Math.round(r.ore_depth_m)+' m incline'],
+    ['Geo confidence',Math.round(r.geological_confidence)+'/100'],['Boreholes',nbh],
+    ['Category',esc(r.resource_category)]];
+  const cw=(W-2*m-16)/cells.length;
+  cells.forEach((c,i)=>{const x=m+10+i*cw;
+    s+='<text x="'+F1(x)+'" y="'+(ty+37)+'" class="mm-tbk">'+c[0]+'</text>'
+      +'<text x="'+F1(x)+'" y="'+(ty+49)+'" class="mm-tbv">'+c[1]+'</text>';});
+  s+='<text x="'+(m+10)+'" y="'+(ty+65)+'" class="mm-tbk">Schematic block plan generated from the block’s geological and operating attributes. '
+    +'Not a surveyed mine plan.</text>';
+  s+='</svg>';
+  mmCache[key]=s; return s;
+}
+
+/* tiny cell thumbnail */
+function minePlanThumb(r){
+  const OC=(r.mining_method==='OC'), rnd=rngOf(fnv(r.location_id)+7);
+  let s='<svg viewBox="0 0 34 22" width="34" height="22" aria-hidden="true">'
+   +'<rect x=".5" y=".5" width="33" height="21" fill="#F4F6F1" stroke="#C3CDD6"/>';
+  if(OC){ for(let i=0;i<3;i++){const f=1-i*0.26;
+      s+='<ellipse cx="17" cy="11.5" rx="'+(11*f)+'" ry="'+(7.2*f)+'" fill="none" stroke="#3C4F63" stroke-width=".8"/>';}
+    s+='<ellipse cx="17" cy="11.5" rx="3.1" ry="2" fill="#6E5470" opacity=".7"/>'; }
+  else { for(let gx=0;gx<5;gx++) for(let gy=0;gy<3;gy++)
+      s+='<rect x="'+(7+gx*4.4)+'" y="'+(5.5+gy*4)+'" width="2.6" height="2.6" fill="#fff" stroke="#1E3247" stroke-width=".55"/>';
+    s+='<path d="M2 11.5H6.4" stroke="#1E3247" stroke-width="1.3"/>'; }
+  return s+'</svg>';
+}
+
+/* hover popover */
+let mmPop=null;
+function mmEnsure(){ if(mmPop) return mmPop;
+  mmPop=document.createElement('div'); mmPop.id='mmpop'; mmPop.setAttribute('role','tooltip');
+  document.body.appendChild(mmPop); return mmPop; }
+function mmShow(ev, lid){
+  const p=mmEnsure(), r=rec(lid), d=decisionFor(lid);
+  p.innerHTML=minePlanSVG(r,d); p.style.display='block';
+  const w=MM_W+2, h=MM_H+2, vw=innerWidth, vh=innerHeight, pad=12;
+  const cr=ev.currentTarget.getBoundingClientRect();
+  let x=cr.left-w-14; if(x<pad) x=Math.min(cr.right+14, vw-w-pad); if(x<pad) x=pad;
+  let y=cr.top+cr.height/2-h/2; y=Math.max(pad, Math.min(y, vh-h-pad));
+  p.style.left=x+'px'; p.style.top=y+'px';
+}
+function mmHide(){ if(mmPop) mmPop.style.display='none'; }
+
+/* ============================== PAGE 1 =============================== */
+function chips(host, values, key, labels) {
+  el(host).innerHTML = values.map(v =>
+    '<button class="chip" data-v="'+esc(v)+'" aria-pressed="'+S.f[key].has(v)+'">'+esc(labels?labels[v]:v)+'</button>').join('');
+  el(host).querySelectorAll('.chip').forEach(b => b.addEventListener('click', () => {
+    const v = b.dataset.v; S.f[key].has(v) ? S.f[key].delete(v) : S.f[key].add(v); render(); }));
+}
+
+function renderP1() {
+  const vis = visible();
+  const cnt = vis.length+' of '+LOCS.length+' shown';
+  el('fcount').textContent = cnt; el('fcount2').textContent = cnt;
+  chips('f-mine', M.mines, 'mine');
+  chips('f-verdict', ['GO','GO_WITH_CONDITIONS','REVIEW_MORE_DATA','NO_GO'], 'verdict', VTXT);
+  chips('f-method', ['OC','UG'], 'method', {OC:'Opencast', UG:'Underground'});
+
+  // KPI strip
+  const ds = vis.map(r => decisionFor(r.location_id));
+  const c = v => ds.filter(d => d.verdict === v).length;
+  const totRes = vis.reduce((a,r) => a+r.reserve_estimate_tonnes, 0);
+  const totFc = vis.reduce((a,r) => a+r.forecast_production_tonnes_month, 0);
+  const aggSf = vis.length ? vis.reduce((a,r) => a+r.shortfall_probability*r.production_target_tonnes_month, 0)
+                             / Math.max(vis.reduce((a,r) => a+r.production_target_tonnes_month,0),1) : 0;
+  const K = [['Potential reserve', fmt(totRes/1e6,2)+' Mt'], ['Locations assessed', vis.length],
+    ['Go', c('GO')], ['Conditional', c('GO_WITH_CONDITIONS')], ['Review', c('REVIEW_MORE_DATA')],
+    ['No-go', c('NO_GO')], ['Tonnage-weighted shortfall risk', (100*aggSf).toFixed(0)+'%']];
+  el('kpis').innerHTML = K.map(k => '<div class="kpi"><div class="l">'+k[0]+'</div><div class="v">'+k[1]+'</div></div>').join('')
+    + '<div class="kpi" style="grid-column:1/-1"><div class="l">Portfolio forecast at the selected scenario</div><div class="v">'
+    + fmt(totFc)+' t/month <span style="font-size:11px;color:var(--steel);font-family:var(--sans)">across the filtered blocks</span></div></div>';
+
+  // table
+  mmHide();
+  const tb = el('loctable').querySelector('tbody');
+  tb.innerHTML = vis.sort((a,b) => decisionFor(b.location_id).score-decisionFor(a.location_id).score).map(r => {
+    const d = decisionFor(r.location_id);
+    return '<tr data-loc="'+r.location_id+'" data-sel="'+(r.location_id === S.sel ? 1 : 0)+'">'
+      + '<td class="mono">'+r.location_id+'<span style="color:var(--mute)"> '+r.block_id+'</span></td>'
+      + '<td>'+r.mine_name+'</td><td>'+r.mining_method+'</td>'
+      + '<td class="n">'+fmt(r.reserve_estimate_tonnes/1000)+'</td>'
+      + '<td class="n">'+r.grade_mn_percent.toFixed(1)+'</td>'
+      + '<td class="n">'+Math.round(r.geological_confidence)+'</td>'
+      + '<td class="n">'+Math.round(r.environmental_severity_score)+'</td>'
+      + '<td class="n">'+Math.round(100*r.shortfall_probability)+'%</td>'
+      + '<td class="n">'+Math.round(r.economic_viability_score)+'</td>'
+      + '<td class="n"><b>'+d.score.toFixed(0)+'</b></td>'
+      + '<td class="n">'+d.conf.toFixed(0)+'</td>'
+      + '<td><span class="vpill" style="background:'+VCOL[d.verdict]+'">'+VTXT[d.verdict]+'</span></td>'
+      + '<td class="mmcell"><button class="mmbtn" type="button" data-mm="'+r.location_id+'" '
+      + 'aria-label="Show mine plan for '+r.location_id+'">'+minePlanThumb(r)+'<span>Plan</span></button></td>'
+      + '<td style="color:var(--steel)">'+r.bottleneck_equipment.replace(/_/g,' ')+'</td></tr>';
+  }).join('') || '<tr><td colspan="14" class="empty">No blocks match these filters. Widen a range or clear the filters.</td></tr>';
+  tb.querySelectorAll('tr[data-loc]').forEach(tr => tr.addEventListener('click', ev => {
+    if (ev.target.closest('.mmbtn')) return; S.sel = tr.dataset.loc; render(); }));
+  tb.querySelectorAll('.mmbtn').forEach(b => {
+    const lid = b.dataset.mm;
+    b.addEventListener('mouseenter', ev => mmShow(ev, lid));
+    b.addEventListener('focus',      ev => mmShow(ev, lid));
+    b.addEventListener('mouseleave', mmHide);
+    b.addEventListener('blur',       mmHide);
+    b.addEventListener('click', ev => { ev.stopPropagation(); S.sel = lid; render(); });
+  });
+
+  // selection panel
+  const r = cur(), d = decisionFor(S.sel);
+  el('selpanel').innerHTML =
+    '<div class="id">'+r.location_id+'</div><div class="where">'+r.mine_name+' · '+r.block_id+' · '
+    + (r.mining_method === 'OC' ? 'Opencast' : 'Underground')+' · '+r.district+'</div>'
+    + '<div class="verdictband" style="background:'+VCOL[d.verdict]+'"><div><div class="sc">'+d.score.toFixed(0)
+    + '<span style="font-size:13px;opacity:.7">/100</span></div><div class="vt">'+VTXT[d.verdict]+'</div></div>'
+    + '<div style="text-align:right;font-size:11px">confidence<br><b class="num" style="font-size:16px">'+d.conf.toFixed(0)+'</b></div></div>'
+    + kv('Reserve', fmt(r.reserve_estimate_tonnes/1e6,2)+' Mt')
+    + kv('Mn grade', r.grade_mn_percent.toFixed(1)+'%')
+    + kv('Geological confidence', Math.round(r.geological_confidence)+'/100')
+    + kv('Forecast production', fmt(r.forecast_production_tonnes_month)+' t/mo')
+    + kv('Shortfall risk', Math.round(100*r.shortfall_probability)+'%')
+    + kv('Economic viability', Math.round(r.economic_viability_score)+'/100')
+    + kv('Bottleneck', r.bottleneck_equipment.replace(/_/g,' '))
+    + '<div style="margin-top:12px"><button class="btn" data-go="p2">View intelligence</button>'
+    + '<button class="btn ghost" data-go="p3">Go to final verdict</button></div>'
+    + '<p class="note" style="margin-top:12px">Hover the <b>Mine plan</b> cell in any row for that block’s schematic plan. '
+    + 'Verdicts are computed under the <b>'+S.scen.replace(/_/g,' ')+'</b> scenario.</p>';
+  el('selpanel').querySelectorAll('[data-go]').forEach(b => b.addEventListener('click', () => go(b.dataset.go)));
+}
+
+const kv = (k,v) => '<div class="kv"><span>'+k+'</span><b>'+v+'</b></div>';
+
+/* ============================== PAGE 2 =============================== */
+function locHeader(host) {
+  const r = cur(), d = decisionFor(S.sel);
+  el(host).innerHTML = '<div class="idblk"><div class="id">'+r.location_id+'</div>'
+    + '<div class="w">'+r.mine_name+' \u00B7 '+r.block_id+' \u00B7 '+(r.mining_method === 'OC' ? 'Opencast' : 'Underground')
+    + ' \u00B7 '+r.district+', '+r.state+' \u00B7 '+r.latitude.toFixed(3)+'\u00B0N '+r.longitude.toFixed(3)+'\u00B0E</div></div>'
+    + ['Overall '+d.score.toFixed(0)+'/100', 'Confidence '+d.conf.toFixed(0)+'/100',
+       'Reserve '+fmt(r.reserve_estimate_tonnes/1e6,2)+' Mt', 'Grade '+r.grade_mn_percent.toFixed(1)+'% Mn',
+       'Forecast '+fmt(r.forecast_production_tonnes_month)+' t/mo']
+      .map(t => { const p = t.split(/ (?=[\d\u20B9])/); return '<div class="hstat"><div class="l">'+p[0]+'</div><div class="v">'+p[1]+'</div></div>'; }).join('')
+    + '<div class="hstat"><div class="l">Verdict</div><div class="v" style="color:'+VCOL[d.verdict]+';font-size:14px">'+VTXT[d.verdict]+'</div></div>'
+    + '<div class="hstat"><div class="l">Data quality</div><div class="v" style="font-size:13px">'+r.data_quality_flag+'</div></div>';
+}
+
+function mrows(lid, sc) { return MON[lid+'|'+(sc||S.scen)]; }
+
+function renderP2() {
+  locHeader('p2hdr');
+  const r = cur(), m = mrows(S.sel);
+  const col = i => m.map(x => x[i]); // 0 rain,1 traffic,2 capacity,3 effhours,4 soilmoist
+
+  el('c-res').innerHTML = '<p class="qn">Is there enough manganese here, and how sure are we?</p>'
+    + kv('Estimated reserve', fmt(r.reserve_estimate_tonnes)+' t')
+    + kv('P10 \u2013 P90 range', fmt(r.reserve_p10_tonnes/1000)+' \u2013 '+fmt(r.reserve_p90_tonnes/1000)+' kt')
+    + kv('Resource category', r.resource_category+'<span class="tag">CRIRSCO</span>')
+    + kv('Geological confidence', Math.round(r.geological_confidence)+'/100')
+    + kv('Ore-zone probability', (100*r.ore_zone_probability).toFixed(0)+'%')
+    + kv('Sampling density', nz(r.sampling_density ? r.sampling_density.toFixed(1)+' holes/km\u00B2' : null, 'not recorded'))
+    + '<p class="note" style="margin-top:10px">The interval widens as geological confidence falls. An Inferred resource cannot be '
+    + 'converted directly to a reserve, which is why low confidence produces a review rather than a no-go.</p>';
+
+  el('c-grade').innerHTML = '<p class="qn">What quality is the ore, and what will it sell as?</p>'
+    + kv('Mn grade', r.grade_mn_percent.toFixed(2)+'%')
+    + kv('Product band', r.ore_type.replace(/_/g,' ').toLowerCase()+'<span class="tag real">real band</span>')
+    + kv('Realised price', '\u20B9'+fmt(r.ore_price_per_tonne)+'/t')
+    + kv('Ore thickness', r.ore_thickness_m.toFixed(1)+' m')
+    + kv('Ore depth', fmt(r.ore_depth_m)+' m')
+    + kv('Strip ratio', r.mining_method === 'OC' ? r.strip_ratio.toFixed(2)+' : 1' : 'not applicable underground');
+
+  el('c-spatial').innerHTML = '<p class="qn">What does the ground look like?</p>'
+    + kv('Elevation', fmt(r.elevation_m)+' m')
+    + kv('Slope', r.slope_degree.toFixed(1)+'\u00B0')
+    + kv('Terrain drainage risk', Math.round(r.drainage_risk)+'/100')
+    + kv('Coordinates', r.latitude.toFixed(4)+', '+r.longitude.toFixed(4))
+    + '<p class="note" style="margin-top:10px">Elevation and slope stand in for an SRTM or Copernicus DEM lookup. '
+    + 'Coordinates are approximate placements, not survey positions.<span class="tag synth">synthetic</span></p>';
+
+  el('c-envchart').innerHTML = '<p class="qn">When in the year does the environment constrain this block?</p>'
+    + '<div style="font-size:10.5px;color:var(--steel);margin-bottom:3px">Monthly rainfall (mm)</div>'
+    + lineChart([{v:col(0), c:'#4A6E8A'}], {h:120, min:0})
+    + '<div style="font-size:10.5px;color:var(--steel);margin:6px 0 3px">Trafficability index (0\u2013100) and soil moisture (m\u00B3/m\u00B3, scaled)</div>'
+    + lineChart([{v:col(1), c:'#B57614'}, {v:col(4).map(x => x*200), c:'#2F7D5B', dash:1}], {h:120, min:0, max:100});
+
+  el('c-envstats').innerHTML = '<p class="qn">How severe are the constraints, and what do they do to the mine?</p>'
+    + '<div class="mini">'
+    + mi('Annual rainfall', fmt(r.annual_rainfall_mm)+' mm') + mi('Rainfall anomaly', r.rainfall_anomaly_percent.toFixed(0)+'%')
+    + mi('Wettest month', fmt(r.monthly_rainfall_mm)+' mm') + mi('Soil moisture', nz(r.soil_moisture ? r.soil_moisture.toFixed(3) : null, 'cloud gap'))
+    + mi('NDVI', nz(r.ndvi ? r.ndvi.toFixed(2) : null, 'cloud gap')) + mi('Surface temperature', nz(r.land_surface_temperature_c ? r.land_surface_temperature_c.toFixed(1)+'\u00B0C' : null, 'cloud gap'))
+    + mi('Trafficability, annual', Math.round(r.trafficability_index)) + mi('Trafficability, monsoon', Math.round(r.trafficability_wet_season))
+    + mi('Haul-road condition', Math.round(r.haul_road_condition)) + mi('Drainage risk', Math.round(r.drainage_risk))
+    + mi('Stand-down days/yr', r.wet_weather_standdown_days_year.toFixed(1)) + mi('Seasonal operating risk', Math.round(r.seasonal_operating_risk))
+    + mi('Environmental severity', Math.round(r.environmental_severity_score)) + mi('Environmental feasibility', Math.round(r.environmental_feasibility_score))
+    + '</div>'
+    + '<p class="note" style="margin-top:10px">Missing soil moisture, NDVI and surface temperature are realistic: optical and passive-microwave '
+    + 'products have genuine monsoon gaps. The engine lowers decision confidence rather than silently imputing.</p>';
+
+  const tgt = m.map(x => x[5]);
+  el('c-prodchart').innerHTML = '<p class="qn">Can we hit the target, and when will we miss it?</p>'
+    + lineChart([{v:col(2), c:'#1E3247', w:2}, {v:tgt, c:'#A32E27', dash:1}],
+        {h:160, min:0, band:{lo:col(2).map(v => v*Math.exp(-1.2816*r.forecast_sigma)), hi:col(2).map(v => v*Math.exp(1.2816*r.forecast_sigma)), color:'#1E3247'},
+         fmtv:v => fmt(v)})
+    + '<div style="font-size:10.5px;color:var(--steel);margin-top:5px">Solid: monthly achievable capacity with P10\u2013P90 band. Dashed: plan target.</div>';
+
+  el('c-prodstats').innerHTML = '<p class="qn">How big is the gap, and where does the uncertainty come from?</p>'
+    + kv('Plan target', fmt(r.production_target_tonnes_month)+' t/mo')
+    + kv('Forecast', fmt(r.forecast_production_tonnes_month)+' t/mo')
+    + kv('P10 \u2013 P90', fmt(r.production_lower_bound)+' \u2013 '+fmt(r.production_upper_bound)+' t/mo')
+    + kv('Shortfall', fmt(r.shortfall_tonnes)+' t/mo  ('+r.shortfall_percent.toFixed(1)+'%)')
+    + kv('P(missing target)', Math.round(100*r.shortfall_probability)+'%')
+    + kv('Forecast sigma', r.forecast_sigma.toFixed(3))
+    + kv('Baseline capability', fmt(r.base_production_capacity_tonnes_month)+' t/mo')
+    + kv('Effective hours', fmt(r.effective_hours_month)+' of '+fmt(r.scheduled_hours_month)+' scheduled');
+
+  el('c-fleet').innerHTML = '<p class="qn">What does the target need, and what is the constraint?</p>'
+    + hbars([{label:'Excavators', a:r.excavators_available, b:r.excavators_required},
+             {label:'Dumpers', a:r.dumpers_available, b:r.dumpers_required},
+             {label:'Loaders', a:r.loaders_available, b:r.loaders_required},
+             {label:'Drills', a:r.drills_available, b:r.drills_required},
+             {label:'Working faces', a:r.active_faces, b:r.faces_required}], {})
+    + '<div style="font-size:10.5px;color:var(--steel);margin:4px 0 8px">Upper bar: available. Lower bar: required (red when short).</div>'
+    + kv('Bottleneck', '<span style="color:var(--nogo)">'+r.bottleneck_equipment.replace(/_/g,' ')+'</span>')
+    + kv('Fleet adequacy', Math.round(r.fleet_adequacy_score)+'/100')
+    + kv('Standby units', r.standby_capacity)
+    + kv('Fleet time allocated to this block', (100*r.fleet_allocation_share).toFixed(0)+'%');
+
+  el('c-equip').innerHTML = '<p class="qn">Is the fleet healthy enough to be relied on?</p>'
+    + '<div class="mini">'
+    + mi('Availability', r.equipment_availability_percent.toFixed(1)+'%') + mi('Utilisation', r.equipment_utilization_percent.toFixed(1)+'%')
+    + mi('Operational efficiency', r.operational_efficiency.toFixed(1)+'%') + mi('Productivity', fmt(r.equipment_productivity)+' t/h')
+    + mi('Downtime', fmt(r.downtime_hours)+' h/mo') + mi('Of which maintenance', nz(r.maintenance_downtime_hours ? fmt(r.maintenance_downtime_hours)+' h' : null, 'not logged'))
+    + mi('Breakdown probability', (100*r.breakdown_probability).toFixed(0)+'%') + mi('Crusher capacity', fmt(r.crusher_capacity_tph)+' t/h')
+    + mi('Haul cycle', nz(r.haul_cycle_time_minutes ? r.haul_cycle_time_minutes.toFixed(1)+' min' : null, 'not logged'))
+    + mi('Blasts / month', r.blasting_frequency)
+    + mi('Blast delay', nz(r.average_blasting_delay_hours ? r.average_blasting_delay_hours.toFixed(1)+' h' : null, 'not logged'))
+    + mi('Blast delay probability', (100*r.blasting_delay_probability).toFixed(0)+'%')
+    + '</div>'
+    + '<p class="note" style="margin-top:10px">Peer-reviewed open-pit benchmarks put shovel and truck availability at 77\u201378% and '
+    + 'utilisation at 61\u201365%. This block sits '+(r.equipment_availability_percent >= 78 ? 'at or above' : 'below')+' the availability benchmark.</p>';
+
+  const parts = [['Drilling','drilling_cost_per_tonne'],['Blasting','blasting_cost_per_tonne'],['Loading','loading_cost_per_tonne'],
+    ['Hauling','hauling_cost_per_tonne'],['Processing','processing_cost_per_tonne'],['Maintenance','maintenance_cost_per_tonne'],
+    ['Fixed overhead','fixed_overhead_per_tonne']].map(p => ({label:p[0], v:r[p[1]]}));
+  el('c-cost').innerHTML = '<p class="qn">Where does the money go per tonne?</p>'
+    + stackbar(parts, r.cost_per_tonne, {})
+    + kv('Total cash cost', '\u20B9'+fmt(r.cost_per_tonne)+'/t')
+    + kv('Variable component', '\u20B9'+fmt(r.variable_cost_per_tonne)+'/t')
+    + kv('Realised price', '\u20B9'+fmt(r.ore_price_per_tonne)+'/t');
+
+  const bem = r.break_even_safety_margin_percent;
+  el('c-be').innerHTML = '<p class="qn">How much room is there before this stops making money?</p>'
+    + kv('Monthly revenue', '\u20B9'+fmt(r.monthly_revenue/1e5,1)+' lakh')
+    + kv('Monthly operating cost', '\u20B9'+fmt(r.monthly_operating_cost/1e5,1)+' lakh')
+    + kv('Operating margin', '<span style="color:'+(r.operating_margin >= 0 ? 'var(--go)' : 'var(--nogo)')+'">\u20B9'
+        + fmt(r.operating_margin/1e5,1)+' lakh  ('+r.operating_margin_percent.toFixed(1)+'%)</span>')
+    + kv('Break-even volume', (r.break_even_tonnes != null && isFinite(r.break_even_tonnes)) ? fmt(r.break_even_tonnes)+' t/mo' : 'never reached at this price')
+    + kv('Break-even price', '\u20B9'+fmt(r.break_even_price)+'/t')
+    + kv('Volume safety margin', '<span style="color:'+(bem >= 0 ? 'var(--go)' : 'var(--nogo)')+'">'+bem.toFixed(1)+'%</span>')
+    + kv('Price safety margin', r.break_even_price_margin_percent.toFixed(1)+'%')
+    + '<p class="note" style="margin-top:10px">Break-even is recomputed from the fixed and variable split every time a scenario or '
+    + 'driver changes. It is a model, not a stored constant.</p>';
+
+  // scenario comparison
+  const base = decisionFor(S.sel,'base_case');
+  el('c-scen').innerHTML = '<table><thead><tr><th>Scenario</th><th style="text-align:right">Forecast t/mo</th>'
+    + '<th style="text-align:right">P(shortfall)</th><th style="text-align:right">Cost \u20B9/t</th>'
+    + '<th style="text-align:right">Margin %</th><th style="text-align:right">Overall</th><th style="text-align:right">\u0394 vs base</th>'
+    + '<th>Verdict</th></tr></thead><tbody>'
+    + M.scenarios.map(sc => { const rr = rec(S.sel, sc), d = assess(rr), dl = d.score-base.score;
+      return '<tr'+(sc === S.scen ? ' data-sel="1"' : '')+' data-scen="'+sc+'"><td>'+sc.replace(/_/g,' ')+'</td>'
+        + '<td class="n">'+fmt(rr.forecast_production_tonnes_month)+'</td>'
+        + '<td class="n">'+Math.round(100*rr.shortfall_probability)+'%</td>'
+        + '<td class="n">'+fmt(rr.cost_per_tonne)+'</td>'
+        + '<td class="n">'+rr.operating_margin_percent.toFixed(1)+'</td>'
+        + '<td class="n"><b>'+d.score.toFixed(1)+'</b></td>'
+        + '<td class="n" style="color:'+(dl > 0.05 ? 'var(--go)' : dl < -0.05 ? 'var(--nogo)' : 'var(--mute)')+'">'
+        + (sc === 'base_case' ? '\u2014' : (dl >= 0 ? '+' : '')+dl.toFixed(1))+'</td>'
+        + '<td><span class="vpill" style="background:'+VCOL[d.verdict]+'">'+VTXT[d.verdict]+'</span></td></tr>'; }).join('')
+    + '</tbody></table>';
+  el('c-scen').querySelectorAll('tr[data-scen]').forEach(tr => tr.addEventListener('click', () => {
+    S.scen = tr.dataset.scen; el('scen').value = S.scen; render(); }));
+}
+const mi = (k,v) => '<div><span>'+k+'</span><b>'+v+'</b></div>';
+
+/* ============================== PAGE 3 =============================== */
+function renderP3() {
+  locHeader('p3hdr');
+  const r = cur(), d = assess(r), sh = shapley(r);
+
+  el('bigcard').style.background = VCOL[d.verdict];
+  el('bigcard').innerHTML = '<div><div style="font-size:11px;opacity:.85">Should MOIL mine this block?</div>'
+    + '<div class="score">'+d.score.toFixed(0)+'<small>/100</small></div><div class="verd">'+VTXT[d.verdict]+'</div></div>'
+    + '<div class="conf">Decision confidence '+d.conf.toFixed(0)+'/100<div class="confbar"><i style="width:'+d.conf+'%"></i></div>'
+    + '<div style="margin-top:12px;font-size:11px;opacity:.9">'+esc(d.why[d.why.length-1])+'</div>'
+    + '<div style="margin-top:10px;font-size:10px;opacity:.75">Fully compensatory weighted sum would score '
+    + overall(r, WV, 1).toFixed(1)+'. The partially compensatory aggregation penalises weak dimensions.</div></div>';
+
+  el('dims').innerHTML = CRIT.map(c => { const v = r[c], b = 100*M.baseline[c], s = sh[c];
+    return '<div class="dimrow"><span>'+M.labels[c]+'</span>'
+      + '<div class="bar"><i style="width:'+v+'%;background:'+(v >= 70 ? 'var(--go)' : v >= 50 ? 'var(--steel)' : 'var(--nogo)')+'"></i>'
+      + '<u style="left:'+b+'%" title="portfolio median"></u></div>'
+      + '<span class="sc">'+Math.round(v)+'</span>'
+      + '<span class="sh '+(s >= 0 ? 'pos' : 'neg')+'">'+(s >= 0 ? '+' : '')+s.toFixed(2)+' pts</span></div>'; }).join('')
+    + '<p class="note" style="margin-top:10px">Contributions are <b>exact Shapley values</b> over the seven criteria against the '
+    + 'portfolio-median reference block. With seven criteria all 128 coalitions are enumerated, so there is no sampling error '
+    + 'and no surrogate model. They sum to the gap between this block and the reference: '
+    + CRIT.reduce((a,c) => a+sh[c], 0).toFixed(2)+' points.</p>';
+
+  const pos = CRIT.map(c => [c, sh[c]]).filter(x => x[1] > 0.15).sort((a,b) => b[1]-a[1]).slice(0,3);
+  const neg = CRIT.map(c => [c, sh[c]]).filter(x => x[1] < -0.15).sort((a,b) => a[1]-b[1]).slice(0,3);
+  el('drivers').innerHTML = '<div style="font-size:11px;color:var(--go);font-weight:600;margin-bottom:4px">What supports the case</div>'
+    + '<ul class="drv">'+(pos.map(p => '<li><span class="mk pos">+</span><span>'+M.labels[p[0]]+' at '+Math.round(r[p[0]])
+      + '/100 <span class="num" style="color:var(--go)">'+p[1].toFixed(2)+' pts</span></span></li>').join('') || '<li><span>Nothing above the reference block.</span></li>')+'</ul>'
+    + '<div style="font-size:11px;color:var(--nogo);font-weight:600;margin:10px 0 4px">What works against it</div>'
+    + '<ul class="drv">'+(neg.map(p => '<li><span class="mk neg">\u2212</span><span>'+M.labels[p[0]]+' at '+Math.round(r[p[0]])
+      + '/100 <span class="num" style="color:var(--nogo)">'+p[1].toFixed(2)+' pts</span></span></li>').join('') || '<li><span>Nothing below the reference block.</span></li>')+'</ul>';
+
+  el('gates').innerHTML = d.gates.length
+    ? d.gates.map(g => '<div class="gate '+(g.sev === 'CONDITION' ? 'cond' : g.sev === 'REVIEW' ? 'rev' : '')+'">'
+        + '<b>'+esc(g.label)+'</b>'+esc(g.detail)+'<div class="basis">'+g.id+' \u00B7 severity '+g.sev+'</div></div>').join('')
+    : '<p class="note">No hard constraint is violated. The verdict rests on the weighted assessment alone.</p>';
+
+  const conds = d.gates.filter(g => g.sev === 'CONDITION');
+  el('conds').innerHTML = (d.verdict === 'GO_WITH_CONDITIONS' || conds.length)
+    ? '<p style="font-size:11.5px;color:var(--steel);margin:0 0 7px">A conditional go stands only once these are closed out:</p>'
+      + '<ul class="drv">'+(conds.length ? conds.map(g => '<li><span class="mk">\u25A1</span><span>'+esc(g.label)+'</span></li>').join('')
+        : '<li><span class="mk">\u25A1</span><span>Complete the recommended actions below before committing the plan.</span></li>')+'</ul>'
+    : d.verdict === 'GO' ? '<p class="note">Unconditional go. Re-assess if any driver below moves past its threshold.</p>'
+    : '<p class="note">The block is not currently in a conditional state; close the constraints above first.</p>';
+
+  el('acts').innerHTML = actionsFor(r).map(a => '<li><b>'+esc(a.action)+'</b>'
+    + '<span class="why">'+esc(a.why)+'</span><span class="eff">'+esc(a.eff)+'</span></li>').join('')
+    || '<li>No mitigation is indicated at the current evidence.</li>';
+
+  // counterfactual sliders
+  el('cfs').innerHTML = DRIVERS.map(dr => {
+    const start = dr.get(r), v = (S.cf[dr.k] !== undefined) ? S.cf[dr.k] : start;
+    const flip = findFlip(r, dr);
+    return '<div class="cf"><div class="hd"><span>'+dr.label+'</span><b>'+dr.fmt(v)+'</b></div>'
+      + '<input type="range" data-d="'+dr.k+'" min="'+dr.min+'" max="'+dr.max+'" step="'+dr.step+'" value="'+v+'">'
+      + '<div class="out"><span>now '+dr.fmt(start)+'</span>'
+      + (flip ? '<span class="flip">verdict changes to '+VTXT[flip.to]+' when it '+flip.dir+' '+dr.fmt(flip.at)+'</span>'
+              : '<span>no verdict change within the tested range</span>')+'</div></div>'; }).join('')
+    + '<button class="resetbtn" id="cfreset" style="margin:10px 0 0">Reset drivers</button>';
+
+  el('cfs').querySelectorAll('input[type=range]').forEach(inp => inp.addEventListener('input', () => {
+    S.cf[inp.dataset.d] = parseFloat(inp.value); renderCfOut(); 
+    inp.closest('.cf').querySelector('.hd b').textContent = DRIVERS.find(x => x.k === inp.dataset.d).fmt(parseFloat(inp.value)); }));
+  el('cfreset').addEventListener('click', () => { S.cf = {}; renderP3(); });
+  renderCfOut();
+
+  // weight sensitivity
+  const alts = [['AHP weights (default)', WV],
+    ['Equal weights', CRIT.map(() => 1/CRIT.length)],
+    ['Economics-led (+50% on economics)', normw(WV.map((w,i) => CRIT[i] === 'economic_viability_score' ? w*1.5 : w))],
+    ['Supply-reliability-led (+50% on production reliability)', normw(WV.map((w,i) => CRIT[i] === 'production_reliability_score' ? w*1.5 : w))],
+    ['Risk-averse (+50% on environment and data confidence)', normw(WV.map((w,i) => ['environmental_feasibility_score','data_confidence_score'].indexOf(CRIT[i]) >= 0 ? w*1.5 : w))],
+    ['Fully compensatory (weighted sum, p = 1)', WV]];
+  el('wsens').innerHTML = '<table><thead><tr><th>Weighting</th><th style="text-align:right">Score</th><th>Verdict</th>'
+    + '<th style="text-align:right">Portfolio go count</th><th style="text-align:right">Rank of this block</th></tr></thead><tbody>'
+    + alts.map((a,i) => { const p = (i === 5) ? 1 : M.p;
+        const sc = overall(r, a[1], p), gs = gatesOf(r), cf = confidenceOf(r, gs), vv = verdictOf(sc, cf, gs).verdict;
+        const all = LOCS.map(l => ({l:l, s:overall(rec(l), a[1], p)})).sort((x,y) => y.s-x.s);
+        const nGo = LOCS.filter(l => { const rr = rec(l), g2 = gatesOf(rr);
+          return verdictOf(overall(rr, a[1], p), confidenceOf(rr, g2), g2).verdict === 'GO'; }).length;
+        const rank = all.findIndex(x => x.l === S.sel)+1;
+        return '<tr'+(i === 0 ? ' data-sel="1"' : '')+'><td>'+a[0]+'</td><td class="n">'+sc.toFixed(1)+'</td>'
+          + '<td><span class="vpill" style="background:'+VCOL[vv]+'">'+VTXT[vv]+'</span></td>'
+          + '<td class="n">'+nGo+'</td><td class="n">'+rank+' of '+LOCS.length+'</td></tr>'; }).join('')
+    + '</tbody></table><p class="note" style="margin-top:9px">If the verdict is identical across every row, it is robust to the '
+    + 'weighting. Where it is not, the verdict depends on a judgement about what matters and should be escalated rather than automated.</p>';
+}
+const normw = a => { const s = a.reduce((x,y) => x+y,0); return a.map(x => x/s); };
+
+function renderCfOut() {
+  const r0 = cur(); let r = r0;
+  DRIVERS.forEach(d => { if (S.cf[d.k] !== undefined && Math.abs(S.cf[d.k]-d.get(r0)) > 1e-9) r = applyDriver(r, d.k, S.cf[d.k]); });
+  const b = assess(r0), d = assess(r), changed = d.verdict !== b.verdict;
+  el('cfout').innerHTML =
+    '<div class="verdictband" style="background:'+VCOL[d.verdict]+'"><div><div class="sc">'+d.score.toFixed(0)
+    + '<span style="font-size:13px;opacity:.7">/100</span></div><div class="vt">'+VTXT[d.verdict]+'</div></div>'
+    + '<div style="text-align:right;font-size:11px">confidence<br><b class="num" style="font-size:16px">'+d.conf.toFixed(0)+'</b></div></div>'
+    + (changed ? '<p class="note" style="border-left:3px solid var(--nogo);background:#FBF2F1">The verdict has changed from <b>'
+        + VTXT[b.verdict]+'</b> to <b>'+VTXT[d.verdict]+'</b>.</p>'
+      : '<p class="note">Verdict unchanged at <b>'+VTXT[b.verdict]+'</b>. Score moved '
+        + (d.score-b.score >= 0 ? '+' : '')+(d.score-b.score).toFixed(1)+' points.</p>')
+    + '<div style="margin-top:10px">'
+    + kv('Forecast production', fmt(r.forecast_production_tonnes_month)+' t/mo  ('+(r.forecast_production_tonnes_month-r0.forecast_production_tonnes_month >= 0 ? '+' : '')+fmt(r.forecast_production_tonnes_month-r0.forecast_production_tonnes_month)+')')
+    + kv('P(shortfall)', Math.round(100*r.shortfall_probability)+'%  ('+((r.shortfall_probability-r0.shortfall_probability) >= 0 ? '+' : '')+Math.round(100*(r.shortfall_probability-r0.shortfall_probability))+'pp)')
+    + kv('Operating margin', r.operating_margin_percent.toFixed(1)+'%  ('+((r.operating_margin_percent-r0.operating_margin_percent) >= 0 ? '+' : '')+(r.operating_margin_percent-r0.operating_margin_percent).toFixed(1)+'pp)')
+    + kv('Break-even safety margin', r.break_even_safety_margin_percent.toFixed(1)+'%')
+    + kv('Economic viability', Math.round(r.economic_viability_score)+'/100')
+    + kv('Production reliability', Math.round(r.production_reliability_score)+'/100')
+    + '</div>'
+    + '<div style="margin-top:10px;font-size:11px;color:var(--steel)"><b>Recommended actions under these conditions</b><ol style="margin:5px 0 0;padding-left:16px">'
+    + (actionsFor(r).slice(0,3).map(a => '<li style="margin-bottom:3px">'+esc(a.action)+'</li>').join('') || '<li>None indicated.</li>')+'</ol></div>';
+}
+
+/* rule-based action engine, ported from decision_engine.ACTION_RULES */
+function actionsFor(r) {
+  const A = [];
+  if (r.drainage_risk > 55 && r.wet_season_flag === 1) A.push({
+    action:'Prepare haul-road drainage and wet-season surfacing before June',
+    why:'Field studies record wet-road cycle-time increases of up to 15.6% and truck productivity losses of up to 13.1%.',
+    eff:'about '+Math.min(9, 0.35*(100-r.haul_road_condition)*0.25).toFixed(1)+'% wet-season production recovered'});
+  if ((r.bottleneck_equipment === 'Dumper' && r.standby_capacity < 2) || r.shortfall_probability > 0.55) A.push({
+    action:'Add standby hauling capacity for the monsoon window',
+    why:'Lifts the binding haulage constraint directly and cuts shortfall probability.',
+    eff:'+'+Math.round(100/Math.max(r.dumpers_available,1))+'% haulage capacity per additional dumper'});
+  if (r.seasonal_operating_risk > 55) A.push({
+    action:'Rebalance the monthly target: reduce June to September, recover October to May',
+    why:'Removes the mismatch between a flat target and a seasonal capacity curve, which is the dominant source of reported shortfall.',
+    eff:'removes about '+Math.min(r.shortfall_percent,12).toFixed(1)+' percentage points of shortfall with no capex'});
+  if (r.data_confidence_score < 60 || r.resource_category === 'Inferred') A.push({
+    action:'Commission infill drilling to upgrade the resource category',
+    why:'The only route from an Inferred resource to a reportable reserve, and it narrows the production interval.',
+    eff:'target 12+ holes/km\u00B2 (now '+(r.sampling_density ? r.sampling_density.toFixed(1) : 'not recorded')+')'});
+  if (r.blasting_delay_probability > 0.35 || (r.average_blasting_delay_hours || 0) > 3) A.push({
+    action:'Re-sequence blasting to compress the delay window',
+    why:'Recovers effective operating hours lost to charging, clearance and re-entry.',
+    eff:'about '+Math.round(r.blasting_frequency*(r.average_blasting_delay_hours||0)*r.blasting_delay_probability*0.4)+' operating hours a month'});
+  if (r.fleet_adequacy_score < 60) A.push({
+    action:'Rematch the loader and truck fleet to remove the imbalance',
+    why:'Loader-truck mismatch is a recognised primary source of queueing loss in shovel-truck systems.',
+    eff:'bottleneck is '+r.bottleneck_equipment.replace(/_/g,' ')+'; need '+r.dumpers_required+' dumpers, have '+r.dumpers_available});
+  if (r.break_even_safety_margin_percent < 25) A.push({
+    action:'Re-run economics under a downside price and fuel case before committing capital',
+    why:'A thin break-even margin means the verdict is price-fragile; the downside case should be the decision case.',
+    eff:'break-even price \u20B9'+fmt(r.break_even_price)+'/t against realised \u20B9'+fmt(r.ore_price_per_tonne)+'/t'});
+  if (r.shortfall_probability > 0.65 && r.seasonal_operating_risk > 50) A.push({
+    action:'Shift committed tonnes to a higher-reliability block for the monsoon quarter',
+    why:'Protects customer supply continuity, the stated business objective, without waiting for capex.',
+    eff:'about '+fmt(r.shortfall_tonnes)+' t a month to source elsewhere'});
+  if (r.equipment_availability_percent < 72) A.push({
+    action:'Move the bottleneck machine onto condition-based maintenance',
+    why:'Availability below the 78% peer-reviewed benchmark points to reactive rather than planned maintenance.',
+    eff:'closing the gap to 78% is worth about '+Math.round(Math.max(0,78-r.equipment_availability_percent)/Math.max(r.equipment_availability_percent,1)*100)+'% capacity where the fleet binds'});
+  return A.slice(0,5);
+}
+
+/* ============================== SHELL ================================ */
+function go(p) { S.page = p; document.querySelectorAll('.page').forEach(s => s.classList.toggle('on', s.id === p));
+  document.querySelectorAll('#nav button').forEach(b => b.setAttribute('aria-current', String(b.dataset.page === p)));
+  window.scrollTo(0,0); render(); }
+
+function render() {
+  if (S.page === 'p1') renderP1();
+  else if (S.page === 'p2') renderP2();
+  else if (S.page === 'p3') renderP3();
+  else renderP3();
+}
+
+/* wiring */
+el('scen').innerHTML = M.scenarios.map(s => '<option value="'+s+'">'+s.replace(/_/g,' ')+'</option>').join('');
+el('scen').value = S.scen;
+el('scen').addEventListener('change', e => { S.scen = e.target.value; S.cf = {}; render(); });
+el('mv').textContent = M.modelVersion; el('dt').textContent = M.dataTimestamp.slice(0,10);
+document.querySelectorAll('#nav button').forEach(b => b.addEventListener('click', () => go(b.dataset.page)));
+el('q').addEventListener('input', e => { S.q = e.target.value; if (S.page === 'p1') renderP1(); });
+[['f-res','res','kt',v => v ? fmt(v)+' kt' : 'any'], ['f-grade','grade','%',v => v > 20 ? v+'% Mn' : 'any'],
+ ['f-conf','conf','',v => v ? v+'/100' : 'any'], ['f-env','env','',v => v < 100 ? '\u2264 '+v : 'any'],
+ ['f-sf','sf','',v => v < 100 ? '\u2264 '+v+'%' : 'any'], ['f-ec','ec','',v => v ? '\u2265 '+v : 'any']]
+ .forEach(([id,key,,f]) => { const inp = el(id);
+   inp.addEventListener('input', () => { S.f[key] = parseFloat(inp.value); el(id+'-v').textContent = f(S.f[key]); renderP1(); });
+   el(id+'-v').textContent = f(S.f[key]); });
+el('reset').addEventListener('click', () => {
+  S.f = {mine:new Set(), verdict:new Set(), method:new Set(), res:0, grade:20, conf:0, env:100, sf:100, ec:0};
+  ['f-res','f-grade','f-conf','f-env','f-sf','f-ec'].forEach(id => { const d = {'f-res':0,'f-grade':20,'f-conf':0,'f-env':100,'f-sf':100,'f-ec':0}[id];
+    el(id).value = d; el(id).dispatchEvent(new Event('input')); });
+  S.q = ''; el('q').value = ''; render(); });
+
+render();
