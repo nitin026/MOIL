@@ -1,0 +1,165 @@
+<header class="top">
+  <div class="brand">
+    <b>MOIL Mining Intelligence</b>
+    <span>Location feasibility and decision support &middot; prototype</span>
+  </div>
+  <nav class="pages" id="nav">
+    <button data-page="p1" aria-current="true">Locations</button>
+    <button data-page="p2">Location intelligence</button>
+    <button data-page="p3">Final verdict</button>
+  </nav>
+  <div class="scenariopick">
+    <label for="scen">Scenario</label>
+    <select id="scen"></select>
+  </div>
+  <div class="topright">
+    <input type="search" id="q" placeholder="Search location or mine" aria-label="Search location or mine">
+    <div class="stamp">model <b id="mv"></b><br>data <b id="dt"></b></div>
+  </div>
+</header>
+
+<!-- =============================== PAGE 1 =============================== -->
+<section class="page on" id="p1">
+
+ <div class="kpis" id="kpis"></div>
+
+ <div class="p1grid">
+   <div class="tablepanel">
+     <div class="pane-h">
+       <h3>Manganese block portfolio</h3>
+       <span class="sub">Nagpur and Bhandara districts, Maharashtra &middot; Balaghat district, Madhya Pradesh</span>
+       <span class="sub" id="fcount" style="margin-left:auto"></span>
+     </div>
+     <div class="tablescroll">
+       <table id="loctable"><thead><tr>
+         <th>Location</th><th>Mine</th><th>Method</th><th style="text-align:right">Reserve kt</th>
+         <th style="text-align:right">Mn %</th><th style="text-align:right">Geo conf</th>
+         <th style="text-align:right">Env risk</th><th style="text-align:right">P(shortfall)</th>
+         <th style="text-align:right">Econ</th><th style="text-align:right">Overall</th>
+         <th style="text-align:right">Conf</th><th>Verdict</th><th>Mine plan</th><th>Bottleneck</th>
+       </tr></thead><tbody></tbody></table>
+     </div>
+   </div>
+
+   <div class="right">
+     <div class="pane-h"><h3>Selected location</h3></div>
+     <div class="sel" id="selpanel"></div>
+   </div>
+ </div>
+
+ <div class="filterbar">
+   <div class="pane-h">
+     <h3>Filters</h3><span class="sub" id="fcount2"></span>
+     <button class="resetbtn" id="reset">Clear all filters</button>
+   </div>
+   <div class="fgrid">
+     <div class="fgroup wide">
+       <label>Mine</label>
+       <div class="chips" id="f-mine"></div>
+     </div>
+     <div class="fgroup wide">
+       <label>Verdict</label>
+       <div class="chips" id="f-verdict"></div>
+     </div>
+     <div class="fgroup">
+       <label>Mining method</label>
+       <div class="chips" id="f-method"></div>
+     </div>
+     <div class="fgroup">
+       <label for="f-res">Minimum reserve</label>
+       <div class="rangerow"><input type="range" id="f-res" min="0" max="3000" step="25" value="0"><span class="v" id="f-res-v">any</span></div>
+     </div>
+     <div class="fgroup">
+       <label for="f-grade">Minimum Mn grade</label>
+       <div class="rangerow"><input type="range" id="f-grade" min="20" max="55" step="1" value="20"><span class="v" id="f-grade-v">any</span></div>
+     </div>
+     <div class="fgroup">
+       <label for="f-conf">Minimum geological confidence</label>
+       <div class="rangerow"><input type="range" id="f-conf" min="0" max="100" step="5" value="0"><span class="v" id="f-conf-v">any</span></div>
+     </div>
+     <div class="fgroup">
+       <label for="f-env">Maximum environmental risk</label>
+       <div class="rangerow"><input type="range" id="f-env" min="0" max="100" step="5" value="100"><span class="v" id="f-env-v">any</span></div>
+     </div>
+     <div class="fgroup">
+       <label for="f-sf">Maximum shortfall probability</label>
+       <div class="rangerow"><input type="range" id="f-sf" min="0" max="100" step="5" value="100"><span class="v" id="f-sf-v">any</span></div>
+     </div>
+     <div class="fgroup">
+       <label for="f-ec">Minimum economic viability</label>
+       <div class="rangerow"><input type="range" id="f-ec" min="0" max="100" step="5" value="0"><span class="v" id="f-ec-v">any</span></div>
+     </div>
+   </div>
+ </div>
+</section>
+
+<!-- =============================== PAGE 2 =============================== -->
+<section class="page" id="p2">
+  <div class="wrap">
+    <div class="lochdr" id="p2hdr"></div>
+
+    <div class="sectitle"><span>Reserve intelligence <em>Person 1</em></span><em>Where is the manganese, how much, what quality, how sure are we?</em></div>
+    <div class="grid3">
+      <div class="card"><h3>Resource estimate <em>with confidence interval</em></h3><div class="body" id="c-res"></div></div>
+      <div class="card"><h3>Grade and ore body</h3><div class="body" id="c-grade"></div></div>
+      <div class="card"><h3>Spatial context</h3><div class="body" id="c-spatial"></div></div>
+    </div>
+
+    <div class="sectitle"><span>Environmental intelligence <em>Person 2</em></span><em>What will the environment do to this mine?</em></div>
+    <div class="grid2">
+      <div class="card"><h3>Rainfall, soil moisture and ground conditions <em>12-month profile</em></h3><div class="body" id="c-envchart"></div></div>
+      <div class="card"><h3>Constraint profile</h3><div class="body" id="c-envstats"></div></div>
+    </div>
+
+    <div class="sectitle"><span>Production forecast <em>Person 3</em></span><em>How much can we realistically produce across the year?</em></div>
+    <div class="grid2">
+      <div class="card"><h3>Target versus forecast <em>P10&ndash;P90 band</em></h3><div class="body" id="c-prodchart"></div></div>
+      <div class="card"><h3>Shortfall and uncertainty budget</h3><div class="body" id="c-prodstats"></div></div>
+    </div>
+
+    <div class="sectitle"><span>Equipment and fleet <em>Person 3</em></span><em>What fleet does the target need, and what is the bottleneck?</em></div>
+    <div class="grid2">
+      <div class="card"><h3>Required versus available</h3><div class="body" id="c-fleet"></div></div>
+      <div class="card"><h3>Availability, utilisation and downtime</h3><div class="body" id="c-equip"></div></div>
+    </div>
+
+    <div class="sectitle"><span>Economics <em>Person 3</em></span><em>Does this block make money, and how much room is there before it stops?</em></div>
+    <div class="grid2">
+      <div class="card"><h3>Cost build-up per tonne</h3><div class="body" id="c-cost"></div></div>
+      <div class="card"><h3>Break-even position</h3><div class="body" id="c-be"></div></div>
+    </div>
+
+    <div class="sectitle"><span>Scenario comparison</span><em>Every scenario re-runs the full chain from modified inputs</em></div>
+    <div class="card"><div class="body" id="c-scen"></div></div>
+  </div>
+</section>
+
+<!-- =============================== PAGE 3 =============================== -->
+<section class="page" id="p3">
+  <div class="wrap">
+    <div class="lochdr" id="p3hdr"></div>
+    <div class="decision">
+      <div class="bigcard" id="bigcard"></div>
+      <div class="card"><h3>Score breakdown <em>bar = score, marker = portfolio median, right column = Shapley contribution in score points</em></h3>
+        <div class="body" id="dims"></div></div>
+    </div>
+
+    <div class="grid3">
+      <div class="card"><h3>Why <em>drivers</em></h3><div class="body" id="drivers"></div></div>
+      <div class="card"><h3>Hard constraints <em>non-compensatory gates</em></h3><div class="body" id="gates"></div></div>
+      <div class="card"><h3>Conditions for a go</h3><div class="body" id="conds"></div></div>
+    </div>
+
+    <div class="sectitle"><span>Recommended actions</span><em>Mapped to the mitigation actions named in the platform specification</em></div>
+    <div class="card"><div class="body"><ol class="acts" id="acts"></ol></div></div>
+
+    <div class="sectitle"><span>What would change the verdict?</span><em>Move a driver; the whole chain and the verdict recompute live</em></div>
+    <div class="grid2">
+      <div class="card"><h3>Counterfactual drivers</h3><div class="body" id="cfs"></div></div>
+      <div class="card"><h3>Live recomputed decision</h3><div class="body" id="cfout"></div></div>
+    </div>
+
+    <div class="sectitle"><span>Weight sensitivity</span><em>Does the verdict survive a different view of what matters?</em></div>
+    <div class="card"><div class="body" id="wsens"></div></div>
+  </div>
+</section>
